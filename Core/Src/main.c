@@ -134,25 +134,167 @@ void hex_to_ascii (const uint8_t *binary, char *str, uint16_t len) {
   }
 }
 
+char *hal_reason[] = {
+  "OK     \n\r", // HAL_OK == 0
+  "ERROR  \n\r", // HAL_ERROR == 1
+  "BUSY   \n\r", // HAL_BUSY == 2
+  "TIMEOUT\n\r", // HAL_TIMEOUT == 3
+};
+
 void i2c_dump(uint16_t dev_address, uint16_t capacity) {
+
   char tx_buff [BUFSIZ] = {0};
   uint8_t read_buff [BUFSIZ / 2] = {0};
   for (uint16_t i = 0; i < capacity; i += BUFSIZ / 2) {
-    if (HAL_I2C_Mem_Read(&hi2c1, dev_address << 1, i, capacity, read_buff, capacity, capacity / 50000) != HAL_OK) {
+    uint8_t reason;
+    if ((reason = HAL_I2C_Mem_Read(&hi2c1, dev_address << 1, i, 8, read_buff, BUFSIZ/2, 500)) != HAL_OK) {
+
       CDC_Transmit_FS((uint8_t *) "No memory on address\n\r", 22);
-      __HAL_RCC_I2C1_FORCE_RESET();
       HAL_Delay(100);
-      __HAL_RCC_I2C1_RELEASE_RESET();
+      CDC_Transmit_FS((uint8_t *) hal_reason[reason], 9); // Got ERROR, and hi2c1.ErrorCode == HAL_I2C_ERROR_TIMEOUT
+      HAL_Delay(100);
+
+//      __HAL_RCC_I2C1_FORCE_RESET();
+//      HAL_Delay(100);
+//      __HAL_RCC_I2C1_RELEASE_RESET();
     }
     else {
-      hex_to_ascii(read_buff, tx_buff, capacity);
-      CDC_Transmit_FS((uint8_t *) tx_buff, capacity * 2);
+      hex_to_ascii(read_buff, tx_buff, BUFSIZ/2);
+      CDC_Transmit_FS((uint8_t *) tx_buff, BUFSIZ);
       CDC_Transmit_FS((uint8_t *) "\n\r", 2);
     }
   }
 }
 
 // todo spi, d28, d32 read & write, i2c write
+
+void i2c_errata() {
+  char* reason = "Unknown";
+
+  // 1. Disable the I2C peripheral by clearing the PE bit in I2Cx_CR1 register.
+  //LL_I2C_Disable(I2C1);
+  CLEAR_BIT(I2C1->CR1, I2C_CR1_PE);
+  HAL_Delay(100); // TODO wait until IDR has right value
+
+  {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+  //  /*Configure GPIO pin Output Level */
+    //HAL_GPIO_WritePin(GPIOB, D6_Pin, GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin = D6_Pin|D7_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL; // GPIO_PULLUP vagy GPIO_PULLDOWN
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH; // GPIO_PULLUP vagy GPIO_PULLDOWN
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_Delay(100); // TODO wait until IDR has right value
+  }
+
+  // 2. Configure the SCL and SDA I/Os as General Purpose Output Open-Drain, High level (Write 1 to GPIOx_ODR)
+  const uint16_t PIN_SDA = D7_Pin;
+  const uint16_t PIN_SCL = D6_Pin;
+  //GPIOB->ODR |= GPIO_PIN_6 | GPIO_PIN_7;
+  ATOMIC_MODIFY_REG(GPIOB->ODR, 0, PIN_SDA | PIN_SCL);
+
+
+  // 3. Check SCL and SDA High level in GPIOx_IDR.
+  HAL_Delay(100); // TODO wait until IDR has right value
+
+  int err = 0;
+  if (READ_BIT(GPIOB->IDR, PIN_SDA | PIN_SCL) != (PIN_SDA | PIN_SCL)) {
+    err = 1;
+    reason = "Error in step 3\n\r";
+  }
+
+  // 4. Configure the SDA I/O as General Purpose Output Open-Drain, Low level (Write 0 to GPIOx_ODR).
+  ATOMIC_MODIFY_REG(GPIOB->ODR, PIN_SDA, 0);
+  // 5. Check SDA Low level in GPIOx_IDR.
+  HAL_Delay(100);
+  if (READ_BIT(GPIOB->IDR, PIN_SDA) != 0) {
+    err = 1;
+    reason = "Error in step 5\n\r";
+    goto label_err;
+  }
+  // 6. Configure the SCL I/O as General Purpose Output Open-Drain, Low level (Write 0 to GPIOx_ODR).
+  ATOMIC_MODIFY_REG(GPIOB->ODR, PIN_SCL, 0);
+  // 7. Check SCL Low level in GPIOx_IDR.
+  HAL_Delay(100);
+  if (READ_BIT(GPIOB->IDR, PIN_SCL) != 0) {
+    err = 1;
+    reason = "Error in step 7\n\r";
+    goto label_err;
+  }
+  // 8. Configure the SCL I/O as General Purpose Output Open-Drain, High level (Write 1 to GPIOx_ODR).
+  ATOMIC_MODIFY_REG(GPIOB->ODR, 0, PIN_SCL);
+  // 9. Check SCL High level in GPIOx_IDR.
+  HAL_Delay(1000);
+  READ_REG(GPIOB->ODR);
+  HAL_Delay(1000);
+  READ_REG(GPIOB->IDR);
+  HAL_Delay(1000);
+  if (READ_BIT(GPIOB->IDR, PIN_SCL) != PIN_SCL) {
+    err = 1;
+    reason = "Error in step 9\n\r";
+    goto label_err;
+  }
+  // 10. Configure the SDA I/O as General Purpose Output Open-Drain , High level (Write 1 to GPIOx_ODR).
+  ATOMIC_MODIFY_REG(GPIOB->ODR, 0, PIN_SDA);
+  // 11. Check SDA High level in GPIOx_IDR.
+  HAL_Delay(1000);
+
+  if (READ_BIT(GPIOB->IDR, PIN_SDA) != PIN_SDA) {
+    err = 1;
+    reason = "Error in step 11\n\r";
+    goto label_err;
+  }
+  // 12. Configure the SCL and SDA I/Os as Alternate function Open-Drain.
+
+  {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    //  /*Configure GPIO pin Output Level */
+    //HAL_GPIO_WritePin(GPIOB, D6_Pin, GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin = D6_Pin|D7_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL; // GPIO_PULLUP vagy GPIO_PULLDOWN
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_Delay(100); // TODO wait until IDR has right value
+  }
+
+  HAL_Delay(100);
+  // 13. Set SWRST bit in I2Cx_CR1 register.
+  SET_BIT(I2C1->CR1, I2C_CR1_SWRST);
+  HAL_Delay(100);
+  // 14. Clear SWRST bit in I2Cx_CR1 register.
+  CLEAR_BIT(I2C1->CR1, I2C_CR1_SWRST);
+  HAL_Delay(100);
+  // 15. Enable the I2C peripheral by setting the PE bit in I2Cx_CR1 register.
+  SET_BIT(I2C1->CR1, I2C_CR1_PE);
+
+label_err:
+  if (err != 0) {
+    uint32_t read_buff = READ_REG(GPIOB->IDR);
+    read_buff &= (PIN_SDA | PIN_SCL);
+
+    char tx_buff [BUFSIZ] = {0};
+    hex_to_ascii((char*)&read_buff, tx_buff, 4);
+    HAL_Delay(100);
+    CDC_Transmit_FS((uint8_t *) tx_buff, 8);
+
+    HAL_Delay(100);
+    CDC_Transmit_FS((uint8_t *) "Error: something happened\n\r", strlen("Error: something happened\n\r"));
+    HAL_Delay(100);
+    CDC_Transmit_FS(reason, strlen(reason));
+  }
+/*  char tx_buff [BUFSIZ] = {0};
+  hex_to_ascii((char*)&read_buff, tx_buff, 4);
+  HAL_Delay(100);
+  CDC_Transmit_FS((uint8_t *) tx_buff, 8);
+
+  HAL_Delay(100);
+  CDC_Transmit_FS((uint8_t *) "\n\r", 2);*/
+
+}
 
 /* USER CODE END 0 */
 
@@ -192,9 +334,10 @@ int main(void)
   char error_msg[] = "Invalid command!\n\r";
   uint32_t i2c_address = 0;
   uint32_t limit_address = 0;
-  __HAL_RCC_I2C1_FORCE_RESET();
-  HAL_Delay(100);
-  __HAL_RCC_I2C1_RELEASE_RESET();
+
+  //__HAL_RCC_I2C1_FORCE_RESET();
+  //HAL_Delay(100);
+  //__HAL_RCC_I2C1_RELEASE_RESET();
   HAL_GPIO_WritePin(ARST_GPIO_Port, ARST_Pin, 0);
   HAL_Delay(100);
   HAL_GPIO_WritePin(ARST_GPIO_Port, ARST_Pin, 1);
@@ -243,22 +386,27 @@ int main(void)
             st = invalid;
         }
       }
+      else if (cmd_buf[0] == 'x') {
+        st = reset_i2c;
+      }
       else {
         st = invalid;
       }
       // receive optional i2c address and limit address
-      uint8_t cursor = 3;                                                                     // 3 = 2 for the command, 1 for a separator
-      cmd_pos -= cursor - 1;
-      if (st == write_i2c || st == read_i2c) {
-        cursor += (homegrown_scanf(cmd_buf + cursor, cmd_pos, &i2c_address, ' '));
-        if (i2c_address == 0) {
+      if (st != reset_i2c) {
+        uint8_t cursor = 3; // 3 = 2 for the command, 1 for a separator
+        cmd_pos -= cursor - 1;
+        if (st == write_i2c || st == read_i2c) {
+          cursor += (homegrown_scanf(cmd_buf + cursor, cmd_pos, &i2c_address, ' '));
+          if (i2c_address == 0) {
+            st = invalid;
+          }
+          cmd_pos -= cursor - 1;
+        }
+        homegrown_scanf(cmd_buf + cursor, cmd_pos, &limit_address, '\r');
+        if (limit_address == 0) {
           st = invalid;
         }
-        cmd_pos -= cursor - 1;
-      }
-      homegrown_scanf(cmd_buf + cursor, cmd_pos, &limit_address, '\r');
-      if (limit_address == 0) {
-        st = invalid;
       }
       //reset cmd_buf and cmd_pos
       memset(cmd_buf, 0, BUFSIZ);
@@ -301,6 +449,10 @@ int main(void)
         break;
       case invalid:
         CDC_Transmit_FS( (uint8_t *) error_msg, strlen(error_msg));
+        st = run;
+        break;
+      case reset_i2c:
+        i2c_errata();
         st = run;
       default:
         continue;
@@ -374,14 +526,14 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 1000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_ENABLE;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
     Error_Handler();
